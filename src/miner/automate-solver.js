@@ -518,11 +518,21 @@ async function submitSolution(address, challengeId, nonce) {
   const url = `${SUBMIT_URL_BASE}/${address}/${challengeId}/${nonce}`;
   console.log(`→ Submitting ${shortAddress(address, 10)} · nonce ${formatNonce(nonce)}`);
 
+  const requestHeaders = { ...REQUEST_HEADERS };
+  const requestBody = {};
+  const requestMetadata = {
+    url,
+    method: 'POST',
+    headers: requestHeaders,
+    body: requestBody,
+    sentAt: new Date().toISOString()
+  };
+
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: REQUEST_HEADERS,
-      body: JSON.stringify({}),
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody)
     });
 
     const text = await response.text();
@@ -533,7 +543,14 @@ async function submitSolution(address, challengeId, nonce) {
       jsonBody = { raw: text };
     }
 
-    // If response is successful, the body should contain the receipt data
+    const responseHeaders = {};
+    if (typeof response.headers?.forEach === 'function') {
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+    }
+    const responseReceivedAt = new Date().toISOString();
+
     if (response.ok && jsonBody) {
       return {
         success: true,
@@ -541,6 +558,9 @@ async function submitSolution(address, challengeId, nonce) {
         statusText: response.statusText,
         receipt: jsonBody,
         rawBody: text,
+        request: requestMetadata,
+        responseHeaders,
+        responseReceivedAt
       };
     }
 
@@ -554,12 +574,18 @@ async function submitSolution(address, challengeId, nonce) {
       rawBody: text,
       retryable,
       retryAfter,
+      request: requestMetadata,
+      responseHeaders,
+      responseReceivedAt
     };
   } catch (error) {
     return {
       success: false,
       error: error.message,
       retryable: true,
+      request: requestMetadata,
+      responseHeaders: null,
+      responseReceivedAt: new Date().toISOString()
     };
   }
 }
@@ -597,6 +623,66 @@ async function saveReceipts(walletFolder, receipts) {
   await fs.mkdir(receiptDir, { recursive: true });
   await fs.writeFile(receiptFile, JSON.stringify(receipts, null, 2) + '\n', 'utf8');
 }
+
+const sanitizeFileSegment = (value, fallback) => {
+  const base = (value ?? fallback ?? '').toString().trim();
+  if (!base) return fallback ?? 'entry';
+  const clean = base
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '');
+  return clean || fallback || 'entry';
+};
+
+const createReceiptLogPath = (walletFolder, challengeId, nonce) => {
+  const challengeSegment = sanitizeFileSegment(challengeId, 'challenge');
+  const nonceSegment = sanitizeFileSegment(nonce, 'nonce');
+  const timestampSegment = new Date().toISOString().replace(/[:.]/g, '-');
+  const fileName = `${challengeSegment}_${nonceSegment}_${timestampSegment}.json`;
+  return path.join(PATHS.receiptsRoot, walletFolder, fileName);
+};
+
+const recordSubmissionReceiptArtifact = async ({
+  walletFolder,
+  walletAddress,
+  challengeId,
+  nonce,
+  submitResult
+}) => {
+  if (!submitResult?.success || !walletFolder) {
+    return;
+  }
+
+  const targetPath = createReceiptLogPath(walletFolder, challengeId, nonce);
+  const payload = {
+    savedAt: new Date().toISOString(),
+    wallet: {
+      folder: walletFolder,
+      address: walletAddress
+    },
+    challengeId: challengeId ?? null,
+    nonce: nonce ?? null,
+    request: submitResult.request ?? null,
+    response: {
+      status: submitResult.status ?? null,
+      statusText: submitResult.statusText ?? null,
+      headers: submitResult.responseHeaders ?? null,
+      receivedAt: submitResult.responseReceivedAt ?? null,
+      body: submitResult.receipt ?? submitResult.body ?? null,
+      rawBody: submitResult.rawBody ?? null
+    }
+  };
+
+  try {
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.writeFile(`${targetPath}`, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    console.warn(
+      `Failed to persist submission receipt for wallet ${walletFolder} (${challengeId ?? 'unknown'}): ${error.message}`
+    );
+  }
+};
 
 /**
  * Check if challenge is already solved for a wallet
@@ -750,6 +836,13 @@ async function submitWalletSolutions(wallet, challenge) {
 
       await saveReceipts(folder, receipts);
       submittedSalts.add(salt);
+      await recordSubmissionReceiptArtifact({
+        walletFolder: folder,
+        walletAddress: address,
+        challengeId,
+        nonce,
+        submitResult
+      });
       
       return {
         success: true,
@@ -1140,6 +1233,13 @@ async function processWallet_OLD(solverBin, wallet, challenge, maxRetries = 3) {
             getReceiptFilePath(folder)
           )}`
         );
+        await recordSubmissionReceiptArtifact({
+          walletFolder: folder,
+          walletAddress: address,
+          challengeId,
+          nonce,
+          submitResult
+        });
         
         // Clean up solution file after successful submission
         try {
@@ -1375,6 +1475,13 @@ async function processWalletSolutions(wallet, challenge) {
           getReceiptFilePath(folder)
         )}`
       );
+      await recordSubmissionReceiptArtifact({
+        walletFolder: folder,
+        walletAddress: address,
+        challengeId,
+        nonce,
+        submitResult
+      });
 
       // If validated, we can stop trying other solutions
       if (receiptData.status === 'validated') {
@@ -1625,4 +1732,3 @@ main().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-
