@@ -1,4 +1,7 @@
 /wallets/
+!/wallets/mining/
+!/wallets/mining/*.json
 /node_modules/
 /miner/
 /solver/target
+
